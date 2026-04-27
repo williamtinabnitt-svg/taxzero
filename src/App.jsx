@@ -1,4 +1,18 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
+
+// ─── PIN CONFIGURATION ────────────────────────────────────────────────────────
+// To add a new user: add an entry to this array.
+// Each user gets their own localStorage key so data never mixes.
+// Format: { pin: "yourpin", label: "Display Name", storageKey: "taxzero_data_unique" }
+const USERS = [
+  { pin: "1234",   label: "Admin",   storageKey: "taxzero_data_admin"   },
+  // Add more users below — each needs a unique pin and storageKey:
+  // { pin: "5678", label: "Client A", storageKey: "taxzero_data_clienta" },
+  // { pin: "9999", label: "Client B", storageKey: "taxzero_data_clientb" },
+];
+
+// Session timeout in minutes (0 = never timeout)
+const SESSION_TIMEOUT_MINS = 60;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const PROP_TYPES = [
@@ -32,6 +46,7 @@ const YEAR_CALENDAR = [
   { month: "Nov–Dec", items: ["Max out all deductible repairs & expenses","Purchase equipment/appliances (Sec 179 election)","Make 4th quarter estimated tax payment (Jan 15)","Confirm bonus dep election with CPA before filing"] },
 ];
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const $f = (n, def="—") => {
   if (n === null || n === undefined || isNaN(n)) return def;
   const a = Math.abs(n);
@@ -70,15 +85,37 @@ const BLANK = () => ({
   propTax:"", insurance:"", repairs:"", utilities:"", mgmtPct:8, other:"",
   capImprovement:"", capImprovLife:15,
   loanBalance:"", interestRate:6.5,
-  priorPassiveLoss:"",
-  equity:"",
+  priorPassiveLoss:"", equity:"",
   costSeg:false, costSegPct:25, bonusPct:60,
-  sec179:"",
-  strHours:"", materialPartic:false,
-  qbiEligible:true,
+  sec179:"", strHours:"", materialPartic:false, qbiEligible:true,
 });
 
-// ─── UI primitives ─────────────────────────────────────────────────────────────
+const DEFAULT_APP_STATE = {
+  props: [BLANK()],
+  w2: "", otherInc: "", filing: "mfj",
+  isREP: false, repHours: "",
+  simPrice: "", simLandPct: 20, simCostSeg: false, simCostSegPct: 25,
+  tab: 0, expandedProp: null,
+};
+
+// ─── localStorage helpers ─────────────────────────────────────────────────────
+const saveToStorage = (key, data) => {
+  try { localStorage.setItem(key, JSON.stringify({ ...data, savedAt: new Date().toISOString() })); }
+  catch(e) { console.warn("localStorage save failed", e); }
+};
+
+const loadFromStorage = (key) => {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    // Strip savedAt from returned data
+    const { savedAt, ...data } = parsed;
+    return data;
+  } catch(e) { return null; }
+};
+
+// ─── CSS ──────────────────────────────────────────────────────────────────────
 const css = `
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700&family=Literata:ital,wght@0,400;0,500;1,400&display=swap');
   *{box-sizing:border-box;margin:0;padding:0;}
@@ -103,10 +140,17 @@ const css = `
   .statbox{background:#090e14;border:1px solid #192530;border-radius:7px;padding:13px 15px;}
   .statbox .sv{font-family:'Literata',serif;font-size:22px;font-weight:500;margin-top:3px;}
   .statbox .sl{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:#3a6080;}
-  .alert{border-radius:6px;padding:10px 14px;font-size:11px;line-height:1.7;margin-bottom:10px;}
   .note{font-size:11px;color:#3a7060;line-height:1.7;margin-bottom:10px;}
+  @keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
+  .shake{animation:shake .4s ease;}
+  @keyframes fadein{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  .fadein{animation:fadein .3s ease;}
+  .pin-dot{width:14px;height:14px;border-radius:50%;border:2px solid #2a6a8a;transition:background .15s;}
+  .pin-dot.filled{background:#5ab8f0;border-color:#5ab8f0;}
+  .saved-pulse{animation:fadein .3s ease;}
 `;
 
+// ─── UI Primitives ────────────────────────────────────────────────────────────
 const Inp = ({v,on,ph,type="text",ro,sfx,w}) => (
   <div style={{position:"relative",width:w||"100%"}}>
     <input type={type} value={v} onChange={on} readOnly={ro} placeholder={ph}
@@ -121,9 +165,7 @@ const Inp = ({v,on,ph,type="text",ro,sfx,w}) => (
 
 const Tog = ({on,click,label,badge,badgeColor}) => (
   <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
-    <button className="tog" onClick={click}
-      style={{background:on?"#1a5a3a":"#162030"}}
-    >
+    <button className="tog" onClick={click} style={{background:on?"#1a5a3a":"#162030"}}>
       <span style={{position:"absolute",width:16,height:16,borderRadius:"50%",background:on?"#4af090":"#2a5a7a",top:3,left:on?21:3,transition:"left .2s"}}/>
     </button>
     <span style={{fontSize:12,color:"#a0c0d8"}}>{label}</span>
@@ -134,24 +176,194 @@ const Tog = ({on,click,label,badge,badgeColor}) => (
 const Lbl = ({c}) => <div className="lbl">{c}</div>;
 const SH = ({c}) => <div className="sh">{c}</div>;
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
-export default function TaxZero() {
-  const [tab, setTab] = useState(0);
-  const [props, setProps] = useState([BLANK()]);
-  const [w2, setW2] = useState("");
-  const [otherInc, setOtherInc] = useState("");
-  const [filing, setFiling] = useState("mfj");
-  const [isREP, setIsREP] = useState(false);
-  const [repHours, setRepHours] = useState("");
-  const [simPrice, setSimPrice] = useState("");
-  const [simLandPct, setSimLandPct] = useState(20);
-  const [simCostSeg, setSimCostSeg] = useState(false);
-  const [simCostSegPct, setSimCostSegPct] = useState(25);
-  const [expandedProp, setExpandedProp] = useState(null);
+// ─── PIN Login Screen ─────────────────────────────────────────────────────────
+function PinLogin({ onSuccess }) {
+  const [pin, setPin] = useState("");
+  const [shake, setShake] = useState(false);
+  const [error, setError] = useState("");
+  const [attempts, setAttempts] = useState(0);
+  const [locked, setLocked] = useState(false);
+  const [lockTimer, setLockTimer] = useState(0);
 
-  const upd = (id,f,v) => setProps(ps=>ps.map(p=>p.id===id?{...p,[f]:v}:p));
-  const addProp = () => { const b=BLANK(); setProps(ps=>[...ps,b]); setExpandedProp(b.id); };
-  const delProp = id => setProps(ps=>ps.filter(p=>p.id!==id));
+  useEffect(() => {
+    if (!locked) return;
+    const interval = setInterval(() => {
+      setLockTimer(t => {
+        if (t <= 1) { setLocked(false); setAttempts(0); clearInterval(interval); return 0; }
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [locked]);
+
+  const tryPin = useCallback((p) => {
+    if (locked) return;
+    const match = USERS.find(u => u.pin === p);
+    if (match) {
+      // Save session
+      sessionStorage.setItem("taxzero_session", JSON.stringify({
+        label: match.label,
+        storageKey: match.storageKey,
+        loginTime: Date.now(),
+      }));
+      onSuccess(match);
+    } else {
+      const newAttempts = attempts + 1;
+      setAttempts(newAttempts);
+      setShake(true);
+      setError(newAttempts >= 5 ? "Too many attempts." : "Incorrect PIN");
+      setPin("");
+      setTimeout(() => setShake(false), 400);
+      if (newAttempts >= 5) { setLocked(true); setLockTimer(30); }
+    }
+  }, [pin, attempts, locked, onSuccess]);
+
+  const pressDigit = (d) => {
+    if (locked || pin.length >= 6) return;
+    const next = pin + d;
+    setPin(next);
+    setError("");
+    if (next.length >= 4) {
+      // Auto-submit when long enough to match any defined PIN length
+      const maxLen = Math.max(...USERS.map(u => u.pin.length));
+      const minLen = Math.min(...USERS.map(u => u.pin.length));
+      if (next.length >= minLen) setTimeout(() => tryPin(next), 80);
+    }
+  };
+
+  const pressBack = () => { setPin(p => p.slice(0,-1)); setError(""); };
+
+  return (
+    <div style={{
+      minHeight:"100vh", background:"#070c11", display:"flex", flexDirection:"column",
+      alignItems:"center", justifyContent:"center", fontFamily:"'Syne',sans-serif",
+    }}>
+      <style>{css}</style>
+      <div className="fadein" style={{textAlign:"center",width:320}}>
+        {/* Logo */}
+        <div style={{marginBottom:32}}>
+          <div style={{fontFamily:"'Literata',serif",fontSize:32,color:"#5ab8f0",fontStyle:"italic",letterSpacing:1}}>TaxZero</div>
+          <div style={{fontSize:9,color:"#2a5a7a",letterSpacing:3,textTransform:"uppercase",marginTop:4}}>Property Tax Offset Engine</div>
+        </div>
+
+        {/* PIN dots */}
+        <div style={{display:"flex",justifyContent:"center",gap:14,marginBottom:28}}>
+          {Array.from({length:Math.max(...USERS.map(u=>u.pin.length),4)}).map((_,i)=>(
+            <div key={i} className={`pin-dot${i<pin.length?" filled":""}`}/>
+          ))}
+        </div>
+
+        {/* Error / Lock */}
+        {(error||locked) && (
+          <div style={{fontSize:11,color:locked?"#e06050":"#c06050",marginBottom:16,letterSpacing:1}}>
+            {locked ? `Locked — try again in ${lockTimer}s` : error}
+          </div>
+        )}
+
+        {/* Keypad */}
+        <div className={shake?"shake":""} style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
+          {[1,2,3,4,5,6,7,8,9,"",0,"⌫"].map((d,i)=>(
+            <button key={i} onClick={()=>d==="⌫"?pressBack():d!==""?pressDigit(String(d)):null}
+              disabled={locked || (d!==""&&d!=="⌫"&&pin.length>=6)}
+              style={{
+                background: d===""?"transparent":"#0f1820",
+                border: d===""?"none":"1px solid #1e2d3a",
+                borderRadius:8, padding:"16px 0",
+                fontFamily:"'Syne',sans-serif",
+                fontSize: d==="⌫"?18:20, fontWeight:600,
+                color: locked?"#2a4a5a": d==="⌫"?"#3a7a8a":"#8ab8d8",
+                cursor: d===""||locked?"default":"pointer",
+                transition:"all .15s",
+              }}
+              onMouseEnter={e=>{ if(d!==""&&!locked) e.target.style.background="#162030"; }}
+              onMouseLeave={e=>{ if(d!=="") e.target.style.background=d===""?"transparent":"#0f1820"; }}
+            >{d}</button>
+          ))}
+        </div>
+
+        <div style={{fontSize:10,color:"#1e3a4a",letterSpacing:1}}>Enter your PIN to continue</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Save Indicator ───────────────────────────────────────────────────────────
+function SaveIndicator({ savedAt }) {
+  if (!savedAt) return null;
+  const t = new Date(savedAt);
+  const timeStr = t.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+  return (
+    <div style={{fontSize:9,color:"#2a5a7a",letterSpacing:1}}>
+      ✓ Saved {timeStr}
+    </div>
+  );
+}
+
+// ─── App Router — handles login gate, keeps hooks legal ──────────────────────
+export default function TaxZero() {
+  const [user, setUser] = useState(() => {
+    try {
+      const sess = sessionStorage.getItem("taxzero_session");
+      if (!sess) return null;
+      const s = JSON.parse(sess);
+      if (SESSION_TIMEOUT_MINS > 0 && Date.now() - s.loginTime > SESSION_TIMEOUT_MINS * 60000) {
+        sessionStorage.removeItem("taxzero_session");
+        return null;
+      }
+      return USERS.find(u => u.storageKey === s.storageKey) || null;
+    } catch { return null; }
+  });
+
+  if (!user) return <PinLogin onSuccess={u => setUser(u)} />;
+  return <Dashboard user={user} onLogout={() => { sessionStorage.removeItem("taxzero_session"); setUser(null); }} />;
+}
+
+// ─── Main Dashboard — only mounts when logged in ─────────────────────────────
+function Dashboard({ user, onLogout }) {
+  const [savedAt, setSavedAt] = useState(null);
+
+  // ── App state — loaded from localStorage on login ──────────────────────────
+  const [appState, setAppState] = useState(DEFAULT_APP_STATE);
+
+  // Destructure for convenience
+  const { props, w2, otherInc, filing, isREP, repHours,
+          simPrice, simLandPct, simCostSeg, simCostSegPct,
+          tab, expandedProp } = appState;
+
+  const set = useCallback((updates) => {
+    setAppState(s => ({ ...s, ...updates }));
+  }, []);
+
+  // ── Load from localStorage when user logs in ───────────────────────────────
+  useEffect(() => {
+    if (!user) return;
+    const saved = loadFromStorage(user.storageKey);
+    if (saved) {
+      // Merge carefully — ensure props have all required fields
+      const mergedProps = (saved.props || [DEFAULT_APP_STATE.props[0]]).map(p => ({
+        ...BLANK(), ...p,
+      }));
+      setAppState({ ...DEFAULT_APP_STATE, ...saved, props: mergedProps });
+      setSavedAt(saved.savedAt || null);
+    }
+  }, [user]);
+
+  // ── Auto-save to localStorage whenever state changes ─────────────────────
+  useEffect(() => {
+    if (!user) return;
+    const timer = setTimeout(() => {
+      saveToStorage(user.storageKey, appState);
+      setSavedAt(new Date().toISOString());
+    }, 800); // debounce 800ms
+    return () => clearTimeout(timer);
+  }, [appState, user]);
+
+  const upd = useCallback((id,f,v) => set({ props: props.map(p => p.id===id ? {...p,[f]:v} : p) }), [props, set]);
+  const addProp = useCallback(() => {
+    const b = BLANK();
+    set({ props: [...props, b], expandedProp: b.id });
+  }, [props, set]);
+  const delProp = useCallback((id) => set({ props: props.filter(p => p.id!==id) }), [props, set]);
 
   // ── Per-property calculations ──────────────────────────────────────────────
   const pCalcs = useMemo(() => props.map(p => {
@@ -159,8 +371,6 @@ export default function TaxZero() {
     const land  = pp * num(p.landPct)/100;
     const bldg  = pp - land;
     const life  = PROP_TYPES.find(t=>t.v===p.type)?.depYrs||27.5;
-
-    // Depreciation
     const slDep   = bldg>0 ? bldg/life : 0;
     let bonusDep=0, accelDep=0;
     if (p.costSeg && bldg>0) {
@@ -171,12 +381,8 @@ export default function TaxZero() {
     const capImprovDep = num(p.capImprovement) / num(p.capImprovLife,15);
     const sec179Ded    = num(p.sec179);
     const totalDep     = slDep + bonusDep + accelDep + capImprovDep + sec179Ded;
-
-    // Income
     const grossRent   = num(p.monthlyRent) * num(p.doors,1) * 12;
     const effRent     = grossRent * (1 - num(p.vacancy)/100);
-
-    // Expenses
     const propTax  = num(p.propTax);
     const ins      = num(p.insurance);
     const repairs  = num(p.repairs);
@@ -184,44 +390,28 @@ export default function TaxZero() {
     const mgmt     = effRent * num(p.mgmtPct)/100;
     const otherExp = num(p.other);
     const totalOpEx = propTax + ins + repairs + utils + mgmt + otherExp;
-
-    // Debt
     const interest = num(p.loanBalance) * num(p.interestRate)/100;
-
-    // QBI (20% of net rental income, if eligible & positive)
     const netBeforeQBI = effRent - totalOpEx - interest - totalDep;
     const qbi = (p.qbiEligible && netBeforeQBI > 0) ? netBeforeQBI * 0.20 : 0;
-
     const taxableIncome  = netBeforeQBI - qbi;
     const NOI            = effRent - totalOpEx;
     const cashFlow       = NOI - interest;
     const capRate        = pp>0 ? NOI/pp : 0;
-    const cocReturn      = pp>0 ? cashFlow/(pp*(1-num(p.loanBalance)/pp||0.25)) : 0;
     const totalDeductions = totalOpEx + interest + totalDep + qbi;
-
     const isSTR       = p.type==="str";
     const strQual     = isSTR && num(p.strHours)>=500;
     const activePartic = p.materialPartic;
     const priorLoss   = num(p.priorPassiveLoss);
-
-    // Monthly cash flow array (simplified seasonal model)
     const monthlyCF = MONTHS.map((_,i) => {
-      const seasonMult = isSTR
-        ? [0.5,0.5,0.8,1.0,1.2,1.5,1.5,1.4,1.1,0.9,0.7,0.8][i]
-        : 1.0;
-      const mRent = effRent/12 * seasonMult;
-      const mExp  = totalOpEx/12;
-      const mInt  = interest/12;
-      return mRent - mExp - mInt;
+      const seasonMult = isSTR ? [0.5,0.5,0.8,1.0,1.2,1.5,1.5,1.4,1.1,0.9,0.7,0.8][i] : 1.0;
+      return (effRent/12 * seasonMult) - (totalOpEx/12) - (interest/12);
     });
-
     return {
       ...p, pp, land, bldg, life,
       slDep, bonusDep, accelDep, capImprovDep, sec179Ded, totalDep,
       grossRent, effRent, propTax, ins, repairs, utils, mgmt, otherExp,
       totalOpEx, interest, NOI, cashFlow, qbi, taxableIncome, totalDeductions,
-      capRate, cocReturn, netBeforeQBI, priorLoss, isSTR, strQual, activePartic,
-      monthlyCF,
+      capRate, netBeforeQBI, priorLoss, isSTR, strQual, activePartic, monthlyCF,
     };
   }), [props]);
 
@@ -231,7 +421,6 @@ export default function TaxZero() {
     let totRent=0,totOpEx=0,totInt=0,totDep=0,totQBI=0;
     let passiveLoss=0, nonPassive=0, activeAllowLoss=0, priorLosses=0;
     let totCF=0, monthlyCF=MONTHS.map(()=>0);
-
     pCalcs.forEach(c=>{
       totRent   += c.effRent;
       totOpEx   += c.totalOpEx;
@@ -241,25 +430,21 @@ export default function TaxZero() {
       priorLosses += c.priorLoss;
       totCF     += c.cashFlow;
       c.monthlyCF.forEach((v,i)=>{ monthlyCF[i]+=v; });
-
       if (c.taxableIncome < 0) {
         const loss = Math.abs(c.taxableIncome);
-        if (c.strQual)         nonPassive       += loss;
-        else if (c.activePartic) activeAllowLoss += loss;
-        else                   passiveLoss      += loss;
+        if (c.strQual)           nonPassive       += loss;
+        else if (c.activePartic) activeAllowLoss  += loss;
+        else                     passiveLoss      += loss;
       }
     });
-
     const repQual = isREP && num(repHours)>=750;
     const magi = ordinary;
     let allowance = 0;
     if (magi<=100000)      allowance = Math.min(activeAllowLoss,25000);
     else if (magi<150000)  allowance = Math.min(activeAllowLoss,25000*(1-(magi-100000)/50000));
-
     let appliedOffset = nonPassive + allowance + priorLosses;
     if (repQual) appliedOffset = nonPassive + activeAllowLoss + passiveLoss + priorLosses;
     appliedOffset = Math.min(appliedOffset, ordinary);
-
     const taxableAfter  = Math.max(0, ordinary - appliedOffset);
     const taxBefore     = calcTax(ordinary, filing);
     const taxAfter      = calcTax(taxableAfter, filing);
@@ -269,8 +454,6 @@ export default function TaxZero() {
     const toZero        = Math.max(0, ordinary - appliedOffset);
     const bracket       = getBracket(taxableAfter, filing);
     const totalDeductions = totOpEx + totInt + totDep + totQBI;
-
-    // New property sim
     const simPP   = num(simPrice);
     const simBldg = simPP * (1-num(simLandPct)/100);
     let simOffset = simBldg>0 ? simBldg/27.5 : 0;
@@ -278,11 +461,8 @@ export default function TaxZero() {
       const ppB = simBldg * num(simCostSegPct)/100;
       simOffset = ppB*0.60 + (simBldg-ppB)/27.5;
     }
-
-    // Cumulative monthly CF
     let cumCF=0;
     const cumulativeCF = monthlyCF.map(v=>{ cumCF+=v; return cumCF; });
-
     return {
       ordinary, totRent, totOpEx, totInt, totDep, totQBI,
       passiveLoss, nonPassive, activeAllowLoss, allowance, priorLosses,
@@ -319,6 +499,15 @@ export default function TaxZero() {
               <div style={{fontSize:15,fontFamily:"'Literata',serif",color:m.col||"#cfe0ee",lineHeight:1.1}}>{m.v}</div>
             </div>
           ))}
+          <div style={{width:1,height:30,background:"#1a2535"}}/>
+          {/* User + save indicator */}
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:9,color:"#2a5a7a",letterSpacing:1,textTransform:"uppercase"}}>{user.label}</div>
+            <SaveIndicator savedAt={savedAt}/>
+          </div>
+          <button onClick={onLogout} style={{background:"none",border:"1px solid #1a2535",borderRadius:5,padding:"5px 12px",color:"#3a6a7a",fontSize:10,fontFamily:"inherit",cursor:"pointer",letterSpacing:1}}>
+            Lock
+          </button>
         </div>
       </div>
 
@@ -330,7 +519,7 @@ export default function TaxZero() {
       {/* ── Tabs ── */}
       <div style={{display:"flex",borderBottom:"1px solid #162230",background:"#08101a",padding:"0 22px",overflowX:"auto"}}>
         {TABS.map((t,i)=>(
-          <button key={t} onClick={()=>setTab(i)} className="tabmb" style={{
+          <button key={t} onClick={()=>set({tab:i})} className="tabmb" style={{
             background:"none",border:"none",padding:"11px 16px",cursor:"pointer",
             fontSize:10,letterSpacing:"2px",textTransform:"uppercase",
             color:tab===i?"#5ab8f0":"#3a6a8a",
@@ -354,8 +543,7 @@ export default function TaxZero() {
               const isOpen = expandedProp===c.id || props.length===1;
               return (
               <div key={c.id} className="card" style={{borderColor:c.taxableIncome<0?"#1a3a2a":"#2a1a1a"}}>
-                {/* Header row — always visible */}
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}} onClick={()=>setExpandedProp(isOpen?null:c.id)}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}} onClick={()=>set({expandedProp:isOpen?null:c.id})}>
                   <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
                     <span style={{fontFamily:"'Literata',serif",fontSize:16,color:"#5ab8f0",fontStyle:"italic"}}>{c.name||`Property ${idx+1}`}</span>
                     <span className="tag" style={{background:c.taxableIncome<0?"#0a2018":"#200a0a",color:c.taxableIncome<0?"#4af090":"#e06050",border:`1px solid ${c.taxableIncome<0?"#1a4028":"#4a1818"}`}}>
@@ -370,7 +558,6 @@ export default function TaxZero() {
                   </div>
                 </div>
 
-                {/* Expanded form */}
                 {isOpen&&(
                 <div style={{marginTop:18}}>
                   <SH c="Identity"/>
@@ -396,9 +583,9 @@ export default function TaxZero() {
                     <div><Lbl c="Annual Interest Ded."/><Inp ro v={c.interest>0?$f(c.interest):""} ph="—"/></div>
                   </div>
                   <div style={{marginBottom:12}}>
-                    <Lbl c="Estimated Equity (for refi/HELOC planning)"/>
+                    <Lbl c="Estimated Equity (refi/HELOC planning)"/>
                     <Inp type="number" v={c.equity} on={e=>upd(c.id,"equity",e.target.value)} ph="e.g. 120,000" w="220px"/>
-                    {num(c.equity)>0&&<span style={{fontSize:11,color:"#3a7060",marginLeft:10}}>Tax-free cash available via cash-out refi or HELOC · deductible interest</span>}
+                    {num(c.equity)>0&&<span style={{fontSize:11,color:"#3a7060",marginLeft:10}}>Tax-free cash via cash-out refi · generates deductible interest</span>}
                   </div>
 
                   <SH c="Rental Income"/>
@@ -417,10 +604,10 @@ export default function TaxZero() {
                   <div className="grid3">
                     <div><Lbl c="Utilities"/><Inp type="number" v={c.utilities} on={e=>upd(c.id,"utilities",e.target.value)} ph="0"/></div>
                     <div><Lbl c="Mgmt Fee"/><Inp type="number" v={c.mgmtPct} on={e=>upd(c.id,"mgmtPct",e.target.value)} ph="8" sfx="%"/></div>
-                    <div><Lbl c="Other (legal, acctg, misc)"/><Inp type="number" v={c.other} on={e=>upd(c.id,"other",e.target.value)} ph="500"/></div>
+                    <div><Lbl c="Other (legal, acctg)"/><Inp type="number" v={c.other} on={e=>upd(c.id,"other",e.target.value)} ph="500"/></div>
                   </div>
                   <div style={{background:"#0a1418",borderRadius:5,padding:"8px 12px",fontSize:10,color:"#2a7a5a",marginBottom:12,lineHeight:1.7}}>
-                    💡 Repairs vs. Improvements: Fixing what's broken (repair, fully deductible now) vs. adding value or extending life (improvement, must be capitalized below). IRS Safe Harbor: items ≤$2,500 each can be expensed immediately.
+                    💡 Repairs (fix what's broken) = fully deductible now. Improvements (add value/extend life) = capitalized below. Items ≤$2,500 each qualify as repairs under IRS Safe Harbor.
                   </div>
 
                   <SH c="Capital Improvements (Depreciated Over Time)"/>
@@ -430,18 +617,13 @@ export default function TaxZero() {
                     <div><Lbl c="Annual Dep. From Improvement"/><Inp ro v={c.capImprovDep>0?$f(c.capImprovDep):""} ph="—"/></div>
                   </div>
 
-                  <SH c="Section 179 / Personal Property (Appliances, Furniture, Equipment)"/>
+                  <SH c="Section 179 — Personal Property (Appliances, Equipment, Furniture)"/>
                   <div className="grid2">
-                    <div>
-                      <Lbl c="Sec. 179 / Bonus Dep. on Personal Property"/>
-                      <Inp type="number" v={c.sec179} on={e=>upd(c.id,"sec179",e.target.value)} ph="e.g. 8,000 for appliances"/>
-                    </div>
-                    <div style={{paddingTop:20,fontSize:11,color:"#3a7060",lineHeight:1.7}}>
-                      Appliances, HVAC units, carpet, furniture — deductible 100% in year purchased under Sec. 179 or bonus dep. Doesn't require a cost seg study.
-                    </div>
+                    <div><Lbl c="Sec. 179 / Bonus Dep. Amount"/><Inp type="number" v={c.sec179} on={e=>upd(c.id,"sec179",e.target.value)} ph="e.g. 8,000"/></div>
+                    <div style={{paddingTop:20,fontSize:11,color:"#3a7060",lineHeight:1.7}}>Appliances, HVAC, carpet, furniture — 100% deductible year purchased. No cost seg needed. Buy before Dec 31.</div>
                   </div>
 
-                  <SH c="Depreciation Accelerator — Cost Segregation"/>
+                  <SH c="Cost Segregation Study"/>
                   <Tog on={c.costSeg} click={()=>upd(c.id,"costSeg",!c.costSeg)} label="Commissioned a Cost Segregation Study" badge="Biggest Single Lever" badgeColor="#f0c840"/>
                   {c.costSeg&&(
                     <div style={{background:"#0a1520",border:"1px solid #1a3040",borderRadius:7,padding:14,marginBottom:12}}>
@@ -450,58 +632,43 @@ export default function TaxZero() {
                         <div><Lbl c="Bonus Dep. Rate"/><Inp type="number" v={c.bonusPct} on={e=>upd(c.id,"bonusPct",e.target.value)} ph="60" sfx="%"/></div>
                         <div><Lbl c="Year-1 Bonus Dep."/><Inp ro v={c.bonusDep>0?$f(c.bonusDep):""} ph="—"/></div>
                       </div>
-                      <div style={{fontSize:10,color:"#3a6a8a",lineHeight:1.7}}>On a ${c.pp>0?(c.pp/1000).toFixed(0)+"k":""} property, reclassifying {c.costSegPct}% to personal property eligible for {c.bonusPct}% bonus dep generates a year-1 deduction of ~{$f(c.bonusDep)}. Study cost: $5k–$15k. Must be completed before Dec 31.</div>
                     </div>
                   )}
 
-                  <SH c="Prior Year Passive Losses (Carry Forward)"/>
+                  <SH c="Prior Year Passive Loss Carryforward"/>
                   <div className="grid2">
-                    <div>
-                      <Lbl c="Undeployed Passive Loss Carryforward"/>
-                      <Inp type="number" v={c.priorPassiveLoss} on={e=>upd(c.id,"priorPassiveLoss",e.target.value)} ph="e.g. 18,000"/>
-                    </div>
-                    <div style={{paddingTop:20,fontSize:11,color:"#3a7060",lineHeight:1.7}}>
-                      Unused passive losses from prior years carry forward indefinitely. They can offset future rental income, or release 100% when you sell the property.
-                    </div>
+                    <div><Lbl c="Undeployed Carryforward Amount"/><Inp type="number" v={c.priorPassiveLoss} on={e=>upd(c.id,"priorPassiveLoss",e.target.value)} ph="e.g. 18,000"/></div>
+                    <div style={{paddingTop:20,fontSize:11,color:"#3a7060",lineHeight:1.7}}>Unused passive losses carry forward indefinitely. They offset future rental income or release 100% on sale.</div>
                   </div>
 
-                  {/* STR participation */}
                   {c.type==="str"&&(
                     <>
-                      <SH c="STR Participation (Bypasses Passive Rules)"/>
-                      <div className="note">STR (avg stay ≤7 days) losses offset W-2 directly with 500+ hrs of participation — no REPS needed. Best single strategy for high W-2 earners.</div>
+                      <SH c="STR Participation"/>
+                      <div className="note">STR losses offset W-2 directly with 500+ hrs participation — no REPS needed. Best path for high W-2 earners.</div>
                       <div className="grid2">
                         <div><Lbl c="Your Annual Hours in This STR"/><Inp type="number" v={c.strHours} on={e=>upd(c.id,"strHours",e.target.value)} ph="500"/></div>
                         <div style={{paddingTop:20}}>
                           <Tog on={c.materialPartic} click={()=>upd(c.id,"materialPartic",!c.materialPartic)}
                             label="Materially Participating"
-                            badge={c.strQual?"✓ Qualified — W-2 Offset Unlocked":"Need 500+ hrs"}
+                            badge={c.strQual?"✓ W-2 Offset Unlocked":"Need 500+ hrs"}
                             badgeColor={c.strQual?"#4af090":"#e06050"}
                           />
                         </div>
                       </div>
                     </>
                   )}
-
-                  {/* Long-term active participation */}
                   {c.type!=="str"&&(
                     <>
                       <SH c="Active Participation — $25k Allowance"/>
-                      <div className="note">If you make management decisions (approve tenants, set rents, select contractors) and own ≥10%, you qualify. Allows up to $25k of losses vs. ordinary income if MAGI ≤$100k (phases to zero at $150k).</div>
+                      <div className="note">Make management decisions + own ≥10% = active participant. Up to $25k of losses vs. ordinary income if MAGI ≤$100k (phases to zero at $150k).</div>
                       <Tog on={c.materialPartic} click={()=>upd(c.id,"materialPartic",!c.materialPartic)} label="I actively participate in this property"/>
                     </>
                   )}
 
-                  {/* QBI */}
-                  <SH c="QBI Deduction (20% Pass-Through)"/>
-                  <Tog on={c.qbiEligible} click={()=>upd(c.id,"qbiEligible",!c.qbiEligible)}
-                    label="Eligible for QBI Deduction (Sec. 199A)"
-                    badge="Often Overlooked"
-                    badgeColor="#5ab8f0"
-                  />
-                  {c.qbiEligible&&<div style={{fontSize:11,color:"#3a6a8a",lineHeight:1.7,marginBottom:10}}>When this property shows net rental income, 20% is deducted automatically. Requires a written rental agreement and 250+ rental hours/yr (or REPS). QBI this year: <strong style={{color:"#5ab8f0"}}>{$f(c.qbi)}</strong></div>}
+                  <SH c="QBI Deduction (20% Pass-Through, Sec. 199A)"/>
+                  <Tog on={c.qbiEligible} click={()=>upd(c.id,"qbiEligible",!c.qbiEligible)} label="Eligible for QBI Deduction" badge="Often Overlooked" badgeColor="#5ab8f0"/>
+                  {c.qbiEligible&&<div style={{fontSize:11,color:"#3a6a8a",lineHeight:1.7,marginBottom:10}}>20% of net rental income deducted automatically. Requires written lease + 250+ rental hrs/yr. QBI this year: <strong style={{color:"#5ab8f0"}}>{$f(c.qbi)}</strong></div>}
 
-                  {/* Property results */}
                   <div style={{borderTop:"1px solid #162230",marginTop:16,paddingTop:14,display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10}}>
                     {[
                       {l:"Gross Rent",v:$f(c.grossRent),col:"#cfe0ee"},
@@ -530,10 +697,10 @@ export default function TaxZero() {
             <div className="card">
               <SH c="Ordinary Income"/>
               <div className="grid3">
-                <div><Lbl c="W-2 / Self-Employment"/><Inp type="number" v={w2} on={e=>setW2(e.target.value)} ph="200,000"/></div>
-                <div><Lbl c="Other Income (dividends, interest)"/><Inp type="number" v={otherInc} on={e=>setOtherInc(e.target.value)} ph="0"/></div>
+                <div><Lbl c="W-2 / Self-Employment"/><Inp type="number" v={w2} on={e=>set({w2:e.target.value})} ph="200,000"/></div>
+                <div><Lbl c="Other Income (dividends, interest)"/><Inp type="number" v={otherInc} on={e=>set({otherInc:e.target.value})} ph="0"/></div>
                 <div><Lbl c="Filing Status"/>
-                  <select className="inp" value={filing} onChange={e=>setFiling(e.target.value)}>
+                  <select className="inp" value={filing} onChange={e=>set({filing:e.target.value})}>
                     <option value="mfj">Married Filing Jointly</option>
                     <option value="single">Single</option>
                     <option value="hoh">Head of Household</option>
@@ -546,36 +713,36 @@ export default function TaxZero() {
                   <span style={{fontSize:14,fontFamily:"'Literata',serif",color:"#e06050"}}>{(T.bracket.rate*100).toFixed(0)}%</span>
                   <span style={{fontSize:11,color:"#3a6a8a",marginLeft:8}}>· Tax before RE: </span>
                   <span style={{fontSize:13,color:"#cfe0ee"}}>{$f(T.taxBefore)}</span>
-                  {T.bracket.nextBracketAt<Infinity&&<span style={{fontSize:11,color:"#3a7060",marginLeft:8}}>· Drop to next bracket by offsetting {$f(T.taxableAfter-T.bracket.prev)}</span>}
+                  {T.bracket.nextBracketAt<Infinity&&<span style={{fontSize:11,color:"#3a7060",marginLeft:8}}>· Drop bracket by offsetting {$f(T.taxableAfter-T.bracket.prev)}</span>}
                 </div>
               )}
             </div>
 
             <div className="card">
-              <SH c="Real Estate Professional Status (REPS) — Full W-2 Offset"/>
-              <Tog on={isREP} click={()=>setIsREP(!isREP)} label="I (or my spouse) qualify as a Real Estate Professional" badge="Unlocks Everything" badgeColor="#f0c840"/>
+              <SH c="Real Estate Professional Status (REPS)"/>
+              <Tog on={isREP} click={()=>set({isREP:!isREP})} label="I (or my spouse) qualify as a Real Estate Professional" badge="Unlocks Everything" badgeColor="#f0c840"/>
               <div style={{background:"#080f18",border:"1px solid #162230",borderRadius:6,padding:14,marginBottom:12,fontSize:11,color:"#5a8aaa",lineHeight:1.8}}>
-                <strong style={{color:"#5ab8f0"}}>Requirements:</strong> (1) &gt;50% of all personal services are in real estate trades/businesses AND (2) &gt;750 hrs/year in those activities.<br/>
-                <strong style={{color:"#5ab8f0"}}>Effect:</strong> Every dollar of rental paper loss offsets W-2 directly. Combined with cost segregation, one property can zero $200k+ of W-2.<br/>
-                <strong style={{color:"#5ab8f0"}}>Documentation:</strong> Keep a daily log — calendar entries, mileage, receipts. IRS audits REPS claims closely.
+                <strong style={{color:"#5ab8f0"}}>Requirements:</strong> &gt;50% of personal services in RE + &gt;750 hrs/year.<br/>
+                <strong style={{color:"#5ab8f0"}}>Effect:</strong> Every rental paper loss offsets W-2 directly.<br/>
+                <strong style={{color:"#5ab8f0"}}>Documentation:</strong> Keep a daily log — IRS audits REPS claims closely.
               </div>
               {isREP&&(
                 <div style={{maxWidth:280}}>
                   <Lbl c="Hours in RE Activities This Year"/>
-                  <Inp type="number" v={repHours} on={e=>setRepHours(e.target.value)} ph="751"/>
-                  {num(repHours)>0&&num(repHours)<750&&<div style={{fontSize:10,color:"#e06050",marginTop:5}}>⚠ Need 750+ hours. Currently {repHours} hrs — {750-num(repHours)} short.</div>}
-                  {num(repHours)>=750&&<div style={{fontSize:10,color:"#4af090",marginTop:5}}>✓ Hour threshold met — all passive losses unlock</div>}
+                  <Inp type="number" v={repHours} on={e=>set({repHours:e.target.value})} ph="751"/>
+                  {num(repHours)>0&&num(repHours)<750&&<div style={{fontSize:10,color:"#e06050",marginTop:5}}>⚠ Need 750+ hours. {750-num(repHours)} short.</div>}
+                  {num(repHours)>=750&&<div style={{fontSize:10,color:"#4af090",marginTop:5}}>✓ Threshold met — all passive losses unlocked</div>}
                 </div>
               )}
             </div>
 
             <div className="card">
-              <SH c="How Your Losses Offset Income (Without REPS)"/>
+              <SH c="How Losses Offset Income (Without REPS)"/>
               {[
-                {t:"STR + 500 hrs Material Participation",col:"#4af090",d:"Non-passive losses — offset W-2 directly, no MAGI limit. Best path for high earners. Requires avg stay ≤7 days and 500+ hours of your personal service time per property."},
-                {t:"$25k Active Participation Allowance",col:"#f0c840",d:"Long-term rental losses offset ordinary income up to $25k/year if MAGI ≤$100k. Phases out completely at $150k. Requires active management decisions (not just passive ownership)."},
-                {t:"Prior Year Passive Loss Carryforwards",col:"#5ab8f0",d:"Unused passive losses from prior years are tracked per property. They offset future rental income in any year — or release 100% when the property is sold (even in a 1031 exchange proceeds can reset the basis for new dep)."},
-                {t:"Passive Losses → Suspend Until Offset or Sale",col:"#8a8aa0",d:"Losses not covered by the above rules are suspended. They offset passive income from other rentals, or discharge when the property is disposed of. Not wasted — just deferred."},
+                {t:"STR + 500 hrs Material Participation",col:"#4af090",d:"Non-passive — offset W-2 directly, no MAGI limit. Best for high earners. Avg stay ≤7 days + 500+ hours of your personal service time."},
+                {t:"$25k Active Participation Allowance",col:"#f0c840",d:"Long-term rental losses offset ordinary income up to $25k/yr if MAGI ≤$100k. Phases out at $150k. Requires active management decisions."},
+                {t:"Prior Year Passive Loss Carryforwards",col:"#5ab8f0",d:"Unused prior losses offset future rental income or release 100% on property sale."},
+                {t:"Passive Losses → Suspended Until Sale",col:"#8a8aa0",d:"Losses not covered above are suspended. Offset passive income from other rentals, or discharge when property is sold."},
               ].map(s=>(
                 <div key={s.t} style={{borderLeft:`3px solid ${s.col}`,paddingLeft:14,marginBottom:14,paddingBottom:14,borderBottom:"1px solid #0f1820"}}>
                   <div style={{fontSize:12,color:s.col,marginBottom:5,fontWeight:600}}>{s.t}</div>
@@ -591,27 +758,19 @@ export default function TaxZero() {
           <div>
             <div className="card">
               <SH c="New Property Purchase Simulator"/>
-              <div className="note">Buying a new property in the current tax year creates an immediate depreciable basis. With cost seg + bonus dep + REPS, a single acquisition can generate enough paper loss to zero remaining income.</div>
+              <div className="note">Buying a new property this year creates an immediate depreciable basis. With cost seg + REPS, one acquisition can zero remaining income.</div>
               <div className="grid3">
-                <div><Lbl c="Purchase Price"/><Inp type="number" v={simPrice} on={e=>setSimPrice(e.target.value)} ph="400,000"/></div>
-                <div><Lbl c="Land Value %"/><Inp type="number" v={simLandPct} on={e=>setSimLandPct(e.target.value)} ph="20" sfx="%"/></div>
+                <div><Lbl c="Purchase Price"/><Inp type="number" v={simPrice} on={e=>set({simPrice:e.target.value})} ph="400,000"/></div>
+                <div><Lbl c="Land Value %"/><Inp type="number" v={simLandPct} on={e=>set({simLandPct:e.target.value})} ph="20" sfx="%"/></div>
                 <div><Lbl c="Year-1 Offset Generated"/><Inp ro v={T.simOffset>0?$f(T.simOffset):""} ph="—"/></div>
               </div>
-              <Tog on={simCostSeg} click={()=>setSimCostSeg(!simCostSeg)} label="Apply Cost Seg + 60% Bonus Depreciation" badge="Recommended" badgeColor="#4af090"/>
-              {simCostSeg&&<div style={{maxWidth:260,marginBottom:12}}><Lbl c="% Reclassified to Personal Property"/><Inp type="number" v={simCostSegPct} on={e=>setSimCostSegPct(e.target.value)} ph="25" sfx="%"/></div>}
+              <Tog on={simCostSeg} click={()=>set({simCostSeg:!simCostSeg})} label="Apply Cost Seg + 60% Bonus Depreciation" badge="Recommended" badgeColor="#4af090"/>
+              {simCostSeg&&<div style={{maxWidth:260,marginBottom:12}}><Lbl c="% Reclassified to Personal Property"/><Inp type="number" v={simCostSegPct} on={e=>set({simCostSegPct:e.target.value})} ph="25" sfx="%"/></div>}
               {T.simOffset>0&&(
                 <div style={{background:"#080f18",border:"1px solid #1a3040",borderRadius:7,padding:14,display:"flex",gap:20,flexWrap:"wrap"}}>
-                  <div>
-                    <div style={{fontSize:9,letterSpacing:2,color:"#2a6a8a",textTransform:"uppercase",marginBottom:4}}>Year-1 Paper Loss</div>
-                    <div style={{fontSize:28,fontFamily:"'Literata',serif",color:"#5ab8f0"}}>{$f(T.simOffset)}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize:9,letterSpacing:2,color:"#2a6a8a",textTransform:"uppercase",marginBottom:4}}>Remaining After This Purchase</div>
-                    <div style={{fontSize:28,fontFamily:"'Literata',serif",color:T.toZero-T.simOffset<=0?"#4af090":"#e06050"}}>{$f(Math.max(0,T.toZero-T.simOffset))}</div>
-                  </div>
-                  <div style={{fontSize:11,color:"#3a7060",paddingTop:8,lineHeight:1.7,flex:1}}>
-                    {T.repQual?"✓ REPS active — offsets W-2 directly":"⚠ Requires REPS or STR to offset W-2. Enable REPS in Income tab."}
-                  </div>
+                  <div><div style={{fontSize:9,letterSpacing:2,color:"#2a6a8a",textTransform:"uppercase",marginBottom:4}}>Year-1 Paper Loss</div><div style={{fontSize:28,fontFamily:"'Literata',serif",color:"#5ab8f0"}}>{$f(T.simOffset)}</div></div>
+                  <div><div style={{fontSize:9,letterSpacing:2,color:"#2a6a8a",textTransform:"uppercase",marginBottom:4}}>Still Taxable After Purchase</div><div style={{fontSize:28,fontFamily:"'Literata',serif",color:T.toZero-T.simOffset<=0?"#4af090":"#e06050"}}>{$f(Math.max(0,T.toZero-T.simOffset))}</div></div>
+                  <div style={{fontSize:11,color:"#3a7060",paddingTop:8,lineHeight:1.7,flex:1}}>{T.repQual?"✓ REPS active — offsets W-2 directly":"⚠ Needs REPS or STR to offset W-2. Enable in Income tab."}</div>
                 </div>
               )}
             </div>
@@ -619,17 +778,17 @@ export default function TaxZero() {
             <div className="card">
               <SH c="All Tax Levers — Ranked by Impact"/>
               {[
-                {lever:"Cost Segregation + Bonus Depreciation",impact:"Extreme",col:"#f0c840",d:"Reclassify 20–40% of building to 5–15yr personal property. 60% bonus dep (2024) on that portion. On a $500k property: ~$50k–$80k year-1 loss. Costs $5k–$15k for the study. ROI immediate. MUST close/complete before Dec 31.",when:"Oct–Dec"},
-                {lever:"REPS Status",impact:"Extreme",col:"#f0c840",d:"Unlocks ALL passive losses against W-2. Requires 750 hrs + >50% of your working time in RE. Log every hour. One spouse qualifying covers both. Game-changing for physicians, executives, and high-earners with RE side.",when:"Year-round"},
-                {lever:"STR Material Participation",impact:"Very High",col:"#5ab8f0",d:"Convert a property to STR (Airbnb, VRBO). Participate 500+ hrs. Losses bypass passive rules completely — offset W-2 without REPS. Even one STR can generate $30k–$60k of non-passive loss.",when:"Year-round"},
-                {lever:"Mortgage Interest",impact:"High",col:"#4af090",d:"100% deductible on rentals — no $750k cap like primary homes. Cash-out refi or HELOC on equity pulls tax-free cash AND increases your interest deduction. Best time: when rates allow positive spread.",when:"Any time"},
-                {lever:"Repairs & Maintenance",impact:"High",col:"#4af090",d:"All repairs fully deductible in the year incurred. IRS Safe Harbor allows items ≤$2,500 each to be expensed (not capitalized). Plan major repairs before Dec 31 to maximize current-year deductions.",when:"Nov–Dec"},
-                {lever:"Section 179 / Personal Property",impact:"High",col:"#4af090",d:"Appliances, HVAC, carpet, furniture — 100% deductible year of purchase. No cost seg study needed. Buy the new water heater, washer/dryer, or smart locks before Dec 31.",when:"Oct–Dec"},
-                {lever:"Insurance Premiums",impact:"Medium",col:"#8ad080",d:"All property insurance is deductible — landlord policy, umbrella, flood, liability. Review annually. Increase coverage on appreciated properties (and get the deduction). Add umbrella policy ($300–$500/yr, very deductible).",when:"Renewal"},
-                {lever:"QBI Deduction (Sec. 199A)",impact:"Medium",col:"#8ad080",d:"20% of net rental income is deductible if you have a written rental agreement and 250+ rental hours/year (or REPS). Often missed. Requires proper recordkeeping — log all hours.",when:"Tax filing"},
-                {lever:"Prior Year Passive Loss Carryforward",impact:"Medium",col:"#8ad080",d:"Track and deploy prior unused passive losses. They offset rental income in profitable years. Release 100% on property sale. Make sure your CPA is tracking these on Form 8582.",when:"Any year"},
-                {lever:"1031 Exchange on Sale",impact:"Extreme (on exit)",col:"#f0c840",d:"Sell appreciated property, defer ALL capital gains + depreciation recapture by rolling into like-kind property within 45/180 days. Stack cost seg on the new property for fresh year-1 losses.",when:"Before listing"},
-                {lever:"Depreciation Recapture Planning",impact:"High (risk)",col:"#e06050",d:"When you sell, the IRS recaptures ALL depreciation taken at 25% (Sec. 1250). On a $300k building held 10 yrs, that's ~$110k taxed at 25% = $27k extra tax. Mitigate with: 1031 exchange, dying with it (step-up in basis), or installment sale."},
+                {lever:"Cost Segregation + Bonus Depreciation",impact:"Extreme",col:"#f0c840",d:"Reclassify 20–40% of building to 5–15yr personal property. 60% bonus dep in year 1. On $500k: ~$50k–$80k paper loss. Study costs $5k–$15k. Must complete before Dec 31.",when:"Oct–Dec"},
+                {lever:"REPS Status",impact:"Extreme",col:"#f0c840",d:"Unlocks ALL passive losses against W-2. 750 hrs + >50% of your working time in RE. Log every hour. One spouse qualifying covers both.",when:"Year-round"},
+                {lever:"STR Material Participation",impact:"Very High",col:"#5ab8f0",d:"Convert a property to STR. Participate 500+ hrs. Losses bypass passive rules completely — offset W-2 without REPS.",when:"Year-round"},
+                {lever:"Mortgage Interest",impact:"High",col:"#4af090",d:"100% deductible on rentals. Cash-out refi or HELOC pulls tax-free cash AND increases interest deduction.",when:"Any time"},
+                {lever:"Repairs & Maintenance",impact:"High",col:"#4af090",d:"Fully deductible year incurred. Items ≤$2,500 each qualify under Safe Harbor. Plan repairs before Dec 31.",when:"Nov–Dec"},
+                {lever:"Section 179 / Personal Property",impact:"High",col:"#4af090",d:"Appliances, HVAC, carpet, furniture — 100% deductible year of purchase. No cost seg needed.",when:"Oct–Dec"},
+                {lever:"Insurance Premiums",impact:"Medium",col:"#8ad080",d:"All property insurance deductible. Add umbrella policy ($300–$500/yr). Increase coverage on appreciated properties.",when:"Renewal"},
+                {lever:"QBI Deduction (Sec. 199A)",impact:"Medium",col:"#8ad080",d:"20% of net rental income deductible. Requires written lease + 250+ rental hours/yr. Often missed.",when:"Tax filing"},
+                {lever:"Prior Passive Loss Carryforward",impact:"Medium",col:"#8ad080",d:"Unused losses offset rental income in profitable years. Release 100% on property sale. Track on Form 8582.",when:"Any year"},
+                {lever:"1031 Exchange on Sale",impact:"Extreme (exit)",col:"#f0c840",d:"Defer ALL capital gains + depreciation recapture by rolling into like-kind property within 45/180 days. Stack cost seg on new property for fresh losses.",when:"Before listing"},
+                {lever:"Depreciation Recapture Risk",impact:"High (risk)",col:"#e06050",d:"On sale, ALL depreciation taken is recaptured at 25% (Sec. 1250). Mitigate with: 1031 exchange, hold until death (step-up in basis), or installment sale."},
               ].map(s=>(
                 <div key={s.lever} style={{display:"flex",gap:12,borderBottom:"1px solid #0f1820",paddingBottom:12,marginBottom:12}}>
                   <div style={{width:70,flexShrink:0,paddingTop:3,textAlign:"center"}}>
@@ -646,7 +805,7 @@ export default function TaxZero() {
           </div>
         )}
 
-        {/* ══════ TAB 3: CASH FLOW TIMELINE ══════ */}
+        {/* ══════ TAB 3: CASH FLOW ══════ */}
         {tab===3&&(
           <div>
             <div className="card">
@@ -657,20 +816,18 @@ export default function TaxZero() {
                   const h=Math.abs(v)/max*120;
                   const pos=v>=0;
                   return (
-                    <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-end",gap:3,position:"relative"}}>
-                      <div style={{fontSize:9,color:pos?"#4af090":"#e06050",letterSpacing:0.5,fontFamily:"'Literata',serif"}}>{v>0?"+":""}{v>=1000||v<=-1000?(v/1000).toFixed(1)+"k":v.toFixed(0)}</div>
-                      <div style={{width:"60%",height:h,background:pos?"#1a4a2a":"#3a1a1a",borderRadius:"3px 3px 0 0",border:`1px solid ${pos?"#2a6a3a":"#5a2a2a"}`,minHeight:2}}/>
+                    <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-end",gap:3}}>
+                      <div style={{fontSize:9,color:pos?"#4af090":"#e06050"}}>{v>=1000||v<=-1000?(v/1000).toFixed(1)+"k":v.toFixed(0)}</div>
+                      <div style={{width:"60%",height:Math.max(h,2),background:pos?"#1a4a2a":"#3a1a1a",borderRadius:"3px 3px 0 0",border:`1px solid ${pos?"#2a6a3a":"#5a2a2a"}`}}/>
                     </div>
                   );
                 })}
               </div>
-              <div style={{display:"flex",gap:0}}>
-                {MONTHS.map(m=><div key={m} style={{flex:1,textAlign:"center",fontSize:9,color:"#2a5a7a"}}>{m}</div>)}
-              </div>
+              <div style={{display:"flex",gap:0}}>{MONTHS.map(m=><div key={m} style={{flex:1,textAlign:"center",fontSize:9,color:"#2a5a7a"}}>{m}</div>)}</div>
             </div>
 
             <div className="card">
-              <SH c="Cumulative Cash Flow — When Can You Fund Improvements?"/>
+              <SH c="Cumulative Cash Flow — When to Fund Improvements"/>
               <div style={{display:"flex",gap:0,alignItems:"flex-end",height:120,marginBottom:8,borderBottom:"1px solid #162230",paddingBottom:4}}>
                 {T.cumulativeCF.map((v,i)=>{
                   const max=Math.max(...T.cumulativeCF.map(Math.abs),1);
@@ -684,24 +841,21 @@ export default function TaxZero() {
                   );
                 })}
               </div>
-              <div style={{display:"flex",gap:0}}>
-                {MONTHS.map(m=><div key={m} style={{flex:1,textAlign:"center",fontSize:9,color:"#2a5a7a"}}>{m}</div>)}
-              </div>
+              <div style={{display:"flex",gap:0}}>{MONTHS.map(m=><div key={m} style={{flex:1,textAlign:"center",fontSize:9,color:"#2a5a7a"}}>{m}</div>)}</div>
               <div style={{marginTop:12,fontSize:11,color:"#3a7060",lineHeight:1.8,background:"#0a1418",padding:"10px 14px",borderRadius:5}}>
-                📊 Fund repairs and improvements when cumulative cash flow is positive. Best window for large-cap improvements: <strong style={{color:"#5ab8f0"}}>Q3 (Aug–Sep)</strong> — cash has built up, and you have time to complete work before Dec 31 for the deduction.
+                📊 Best window for large improvements: <strong style={{color:"#5ab8f0"}}>Q3 (Aug–Sep)</strong> — cash has built up and you have time to complete before Dec 31 for the deduction.
               </div>
             </div>
 
             <div className="card">
-              <SH c="Tax Action Calendar — What to Do and When"/>
+              <SH c="Tax Action Calendar"/>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
                 {YEAR_CALENDAR.map(p=>(
                   <div key={p.month} style={{background:"#080f18",border:"1px solid #162230",borderRadius:7,padding:14}}>
                     <div style={{fontSize:11,color:"#5ab8f0",fontWeight:700,letterSpacing:1,marginBottom:10}}>{p.month}</div>
                     {p.items.map(item=>(
                       <div key={item} style={{display:"flex",gap:8,marginBottom:7,fontSize:11,color:"#5a8090",lineHeight:1.5}}>
-                        <span style={{color:"#2a6a8a",flexShrink:0}}>→</span>
-                        <span>{item}</span>
+                        <span style={{color:"#2a6a8a",flexShrink:0}}>→</span><span>{item}</span>
                       </div>
                     ))}
                   </div>
@@ -712,13 +866,13 @@ export default function TaxZero() {
             <div className="card">
               <SH c="Year-End Deadline Checklist"/>
               {[
-                {d:"Dec 31",item:"Cost seg study placed in service",note:"Property must be in service in the tax year for bonus dep to apply"},
-                {d:"Dec 31",item:"All repairs completed & invoiced",note:"Deductible in year incurred — not when paid if on accrual"},
-                {d:"Dec 31",item:"Sec. 179 / personal property purchased",note:"Appliances, equipment must be placed in service (installed & operational)"},
-                {d:"Dec 31",item:"New property closed",note:"Must close escrow by Dec 31 for year-1 depreciation"},
-                {d:"Dec 31",item:"Maximize STR hours if close to 500",note:"Log every hour — cleaning, guest comms, maintenance coordination"},
-                {d:"Jan 15",item:"Q4 estimated tax payment",note:"Avoid underpayment penalty — adjust if RE offsets reduce liability"},
-                {d:"Apr 15",item:"File taxes or extend",note:"6-month extension available — use it if cost seg study not yet finalized"},
+                {d:"Dec 31",item:"Cost seg study placed in service",note:"Property must be in service in the tax year for bonus dep"},
+                {d:"Dec 31",item:"All repairs completed & invoiced",note:"Deductible year incurred"},
+                {d:"Dec 31",item:"Sec. 179 property purchased & installed",note:"Must be placed in service — not just ordered"},
+                {d:"Dec 31",item:"New property closed",note:"Must close escrow for year-1 depreciation"},
+                {d:"Dec 31",item:"Maximize STR hours if near 500",note:"Log cleaning, guest comms, maintenance coordination"},
+                {d:"Jan 15",item:"Q4 estimated tax payment",note:"Adjust if RE offsets reduce liability"},
+                {d:"Apr 15",item:"File or extend",note:"Use extension if cost seg study not yet finalized"},
               ].map(r=>(
                 <div key={r.item} style={{display:"grid",gridTemplateColumns:"60px 1fr 1fr",gap:12,borderBottom:"1px solid #0f1820",padding:"10px 0",alignItems:"start"}}>
                   <span className="tag" style={{background:"#1a1a0a",color:"#f0c840",border:"1px solid #3a3a1a",fontSize:9}}>{r.d}</span>
@@ -733,7 +887,6 @@ export default function TaxZero() {
         {/* ══════ TAB 4: TAX SUMMARY ══════ */}
         {tab===4&&(
           <div>
-            {/* Zero meter */}
             <div style={{background:"linear-gradient(135deg,#0a1520,#080f14)",border:"1px solid #1a3040",borderRadius:10,padding:22,marginBottom:20}}>
               <div style={{fontSize:9,letterSpacing:3,textTransform:"uppercase",color:"#2a6a8a",marginBottom:14}}>Tax Zero Progress</div>
               <div style={{display:"flex",justifyContent:"space-between",marginBottom:8,fontSize:12,color:"#4a7a8a",flexWrap:"wrap",gap:8}}>
@@ -749,37 +902,26 @@ export default function TaxZero() {
                 <span style={{fontSize:14,fontFamily:"'Literata',serif",color:zColor,fontWeight:600}}>{T.zeroPct.toFixed(1)}% zeroed</span>
                 <span>100%</span>
               </div>
-              {T.toZero>0&&(
-                <div style={{marginTop:12,background:"#0a1018",borderRadius:5,padding:"10px 14px",fontSize:11,color:"#6a9ab8",lineHeight:1.7}}>
-                  Need <strong style={{color:"#f0c840"}}>{$f(T.toZero)}</strong> more in deductions to reach Tax Zero.
-                  {!T.repQual&&" Enabling REPS would unlock all passive losses immediately."}
-                </div>
-              )}
-              {T.taxableAfter===0&&T.ordinary>0&&(
-                <div style={{marginTop:12,background:"#0a1a10",border:"1px solid #1a3a20",borderRadius:5,padding:"10px 14px",fontSize:12,color:"#4af090"}}>
-                  ✓ Tax Zero achieved — your real estate deductions fully offset your ordinary income.
-                </div>
-              )}
+              {T.toZero>0&&<div style={{marginTop:12,background:"#0a1018",borderRadius:5,padding:"10px 14px",fontSize:11,color:"#6a9ab8",lineHeight:1.7}}>Need <strong style={{color:"#f0c840"}}>{$f(T.toZero)}</strong> more in deductions to reach Tax Zero.{!T.repQual&&" Enabling REPS would unlock all passive losses immediately."}</div>}
+              {T.taxableAfter===0&&T.ordinary>0&&<div style={{marginTop:12,background:"#0a1a10",border:"1px solid #1a3a20",borderRadius:5,padding:"10px 14px",fontSize:12,color:"#4af090"}}>✓ Tax Zero achieved.</div>}
             </div>
 
-            {/* Tax comparison */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:14,marginBottom:20}}>
               <div className="statbox"><div className="sl">Tax Without RE</div><div className="sv" style={{color:"#e06050"}}>{$f(T.taxBefore)}</div></div>
-              <div className="statbox"><div className="sl">Tax With RE Offsets</div><div className="sv" style={{color:"#cfe0ee"}}>{$f(T.taxAfter)}</div></div>
+              <div className="statbox"><div className="sl">Tax With RE</div><div className="sv" style={{color:"#cfe0ee"}}>{$f(T.taxAfter)}</div></div>
               <div className="statbox"><div className="sl">Total Tax Saved</div><div className="sv" style={{color:"#f0c840"}}>{$f(T.taxSaved)}</div></div>
               <div className="statbox"><div className="sl">Effective Rate</div><div className="sv" style={{color:T.effectiveRate<0.15?"#4af090":T.effectiveRate<0.25?"#f0c840":"#e06050"}}>{pct(T.effectiveRate)}</div></div>
             </div>
 
-            {/* Bracket visualizer */}
             {T.ordinary>0&&(
               <div className="card" style={{marginBottom:14}}>
                 <SH c="Tax Bracket Visualizer"/>
                 {(filing==="mfj"?TAX_BRACKETS_MFJ:TAX_BRACKETS_SINGLE).map((b,i,arr)=>{
-                  const low = i===0?0:arr[i-1].up;
-                  const high = b.up===Infinity?Math.max(T.ordinary,T.taxableAfter)+10000:b.up;
-                  const incomeInBracket = Math.max(0,Math.min(T.ordinary,high)-low);
-                  const afterInBracket  = Math.max(0,Math.min(T.taxableAfter,high)-low);
-                  if (incomeInBracket<=0&&afterInBracket<=0) return null;
+                  const low=i===0?0:arr[i-1].up;
+                  const high=b.up===Infinity?Math.max(T.ordinary,T.taxableAfter)+10000:b.up;
+                  const incomeInBracket=Math.max(0,Math.min(T.ordinary,high)-low);
+                  const afterInBracket=Math.max(0,Math.min(T.taxableAfter,high)-low);
+                  if(incomeInBracket<=0&&afterInBracket<=0) return null;
                   const maxW=Math.max(incomeInBracket,afterInBracket);
                   return (
                     <div key={i} style={{marginBottom:10}}>
@@ -805,7 +947,6 @@ export default function TaxZero() {
               </div>
             )}
 
-            {/* Deduction breakdown */}
             <div className="card">
               <SH c="Full Deduction Breakdown"/>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
@@ -828,26 +969,23 @@ export default function TaxZero() {
               </div>
             </div>
 
-            {/* Depreciation recapture warning */}
             <div style={{background:"#160a0a",border:"1px solid #3a1a1a",borderRadius:8,padding:16,marginBottom:14}}>
-              <div style={{fontSize:11,color:"#e06050",fontWeight:600,marginBottom:8}}>⚠ Depreciation Recapture — Plan Now, Not Later</div>
+              <div style={{fontSize:11,color:"#e06050",fontWeight:600,marginBottom:8}}>⚠ Depreciation Recapture — Plan Now</div>
               <div style={{fontSize:11,color:"#7a4a4a",lineHeight:1.8}}>
-                When you sell, the IRS taxes all depreciation taken at <strong style={{color:"#e08060"}}>25% (Sec. 1250 recapture)</strong> — regardless of your bracket.
-                Total depreciation taken across portfolio: <strong style={{color:"#f0c840"}}>{$f(T.totDep)}</strong>/yr.
-                <br/>Mitigation: <span style={{color:"#c07060"}}>1031 Exchange</span> (defer indefinitely) · <span style={{color:"#c07060"}}>Die holding it</span> (step-up in basis eliminates recapture) · <span style={{color:"#c07060"}}>Installment sale</span> (spread recapture over years).
+                When you sell, all depreciation is recaptured at <strong style={{color:"#e08060"}}>25% (Sec. 1250)</strong>. Annual dep across portfolio: <strong style={{color:"#f0c840"}}>{$f(T.totDep)}</strong>/yr.
+                Mitigate: <span style={{color:"#c07060"}}>1031 Exchange</span> · <span style={{color:"#c07060"}}>Hold until death (step-up)</span> · <span style={{color:"#c07060"}}>Installment sale</span>
               </div>
             </div>
 
-            {/* Dynamic action items */}
             <div className="card">
               <SH c="Your Personalized Next Steps"/>
               {[
-                T.toZero>0&&!T.repQual&&{step:"Enable REPS to unlock remaining "+$f(T.toZero)+" in offsets",urgent:true,d:"Track and document hours now. If you or your spouse can hit 750 hrs in RE activities this year, every pending passive loss deploys against your W-2."},
-                T.toZero>0&&{step:"Commission a cost seg study on your highest-value property",urgent:true,d:`A study on your largest property could generate ${$f(T.toZero)} or more in year-1 deductions — eliminating your remaining taxable income. Must be ordered and completed before Dec 31.`},
-                pCalcs.some(c=>c.type!=="str"&&!c.materialPartic)&&{step:"Enable active participation on all long-term rentals",urgent:false,d:"Check the 'actively participate' toggle on each long-term rental. If your MAGI is under $150k, this unlocks up to $25k/yr of losses against ordinary income."},
-                !pCalcs.some(c=>c.type==="str")&&{step:"Evaluate converting or acquiring one STR",urgent:false,d:"A single short-term rental where you materially participate can produce $30k–$60k of non-passive losses that offset W-2 without REPS — the best option for high earners."},
-                pCalcs.some(c=>c.qbiEligible&&c.qbi===0&&c.effRent>0)&&{step:"Verify QBI eligibility and hours documentation",urgent:false,d:"20% of net rental income is tax-free under Sec. 199A. Requires 250+ rental hours/year logged and a written lease. Often missed — worth $2k–$10k+ per property."},
-                {step:"Review repairs vs. improvements before Dec 31",urgent:false,d:"Any repair under $2,500 can be expensed immediately. Plan and complete routine maintenance before year-end. Communicate Safe Harbor policy to your CPA."},
+                T.toZero>0&&!T.repQual&&{step:"Enable REPS to unlock remaining "+$f(T.toZero)+" in offsets",urgent:true,d:"Track hours now. If you or your spouse can hit 750 hrs in RE activities this year, every pending passive loss deploys against your W-2."},
+                T.toZero>0&&{step:"Commission a cost seg study on your highest-value property",urgent:true,d:`Could generate ${$f(T.toZero)} or more in year-1 deductions. Must be completed before Dec 31.`},
+                pCalcs.some(c=>c.type!=="str"&&!c.materialPartic)&&{step:"Enable active participation on all long-term rentals",urgent:false,d:"Unlocks up to $25k/yr of losses against ordinary income if MAGI ≤$150k."},
+                !pCalcs.some(c=>c.type==="str")&&{step:"Evaluate acquiring one STR",urgent:false,d:"One STR with material participation can produce $30k–$60k non-passive losses offsetting W-2 without REPS."},
+                pCalcs.some(c=>c.qbiEligible&&c.qbi===0&&c.effRent>0)&&{step:"Verify QBI eligibility and hours documentation",urgent:false,d:"20% of net rental income is tax-free under Sec. 199A. Requires 250+ rental hours/year logged."},
+                {step:"Review repairs vs. improvements before Dec 31",urgent:false,d:"Any repair under $2,500 can be expensed immediately. Plan and complete routine maintenance before year-end."},
               ].filter(Boolean).map((s,i)=>(
                 <div key={i} style={{display:"flex",gap:12,borderBottom:"1px solid #0f1820",paddingBottom:12,marginBottom:12}}>
                   <span style={{color:s.urgent?"#f0c840":"#2a7a5a",fontSize:14,flexShrink:0,marginTop:1}}>{s.urgent?"!":"→"}</span>
@@ -860,7 +998,7 @@ export default function TaxZero() {
             </div>
 
             <div style={{fontSize:10,color:"#1e3a4a",lineHeight:1.8,padding:"12px 14px",background:"#070c10",borderRadius:6,border:"1px solid #162230"}}>
-              ⚠ Educational tool — not tax advice. Actual tax calculations require Form 8582, Sec. 469, Sec. 199A, and state-specific rules. Depreciation recapture, AMT, NIIT (3.8% on passive income above thresholds), and carryforward rules are simplified. Consult a CPA or tax attorney specializing in real estate investors before implementing any strategy.
+              ⚠ Educational tool — not tax advice. Consult a CPA or tax attorney specializing in real estate before implementing any strategy.
             </div>
           </div>
         )}
